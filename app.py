@@ -1,102 +1,129 @@
-import os
-import re
 import base64
-import urllib.parse
+import json
 from urllib.parse import parse_qs, urlparse
-from flask import Flask
-from threading import Thread
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import telebot
 
-# Flask Web Server (Render/Keep-Alive)
-app = Flask(__name__)
+# Yahan apna Telegram Bot ka Token daalo
+TOKEN = "BOT_TOKEN"
+bot = telebot.TeleBot(TOKEN)
 
-@app.route('/')
-def home():
-    return "Auto-Decoder Bot Active!"
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+def decode_single_url(text):
+  try:
+    parsed_url = urlparse(text.strip())
+    query_params = parse_qs(parsed_url.query)
 
-# Automatic Multi-Round Deep Decoder
-def auto_decode_text(text: str) -> str:
-    current = text.strip()
-    
-    # 1. Extract query parameter if it's a URL
-    if "http" in current and "?" in current:
-        parsed_url = urlparse(current)
-        query_params = parse_qs(parsed_url.query)
-        for k, v in query_params.items():
-            if v and len(v[0]) > 10:
-                current = v[0]
-                break
+    encoded_data = None
+    param_type = "json"
 
-    # 2. URL Unquote
-    current = urllib.parse.unquote(current)
+    # Check karo ki kaun sa parameter hai ('m', 's', ya 'share')
+    if "share" in query_params:
+      encoded_data = query_params["share"][0]
+    elif "m" in query_params:
+      encoded_data = query_params["m"][0]
+    elif "s" in query_params:
+      encoded_data = query_params["s"][0]
+      param_type = "string"
 
-    # 3. Multi-round Base64 Decoding
-    for _ in range(5):
-        try:
-            missing_padding = len(current) % 4
-            if missing_padding:
-                current += '=' * (4 - missing_padding)
-            
-            clean_b64 = current.replace(' ', '+')
-            decoded_bytes = base64.b64decode(clean_b64)
-            decoded_str = decoded_bytes.decode('utf-8', errors='ignore')
-            
-            if decoded_str and decoded_str != current:
-                current = urllib.parse.unquote(decoded_str)
-            else:
-                break
-        except Exception:
-            break
+    if encoded_data:
+      # URL-safe Base64 ko standard base64 mein convert karo
+      encoded_data = encoded_data.replace("-", "+").replace("_", "/")
 
-    return current
+      padding = len(encoded_data) % 4
+      if padding > 0:
+        encoded_data += "=" * (4 - padding)
 
-# Telegram Handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send link to decode.")
+      decoded_bytes = base64.b64decode(encoded_data)
+      decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    
-    # Automatic Deep Decode
-    decoded_content = auto_decode_text(text)
+      # Agar 's' parameter hai ya JSON nahi hai, toh check karo ki ||| se jude hain kya
+      if param_type == "string":
+        if "|||" in decoded_str:
+          split_urls = decoded_str.split("|||")
+          return [{"url": u.strip(), "key": "N/A"} for u in split_urls if u.strip()]
+        return [{"url": decoded_str, "key": "N/A"}]
 
-    # Extract all HTTP/HTTPS links from decoded content & original text
-    link_pattern = r'https?://[^\s<>"]+'
-    found_links = re.findall(link_pattern, decoded_content) + re.findall(link_pattern, text)
-    unique_links = list(dict.fromkeys(found_links))
+      # JSON parse karne ki koshish karo
+      try:
+        parsed_json = json.loads(decoded_str)
+        if isinstance(parsed_json, dict):
+          # Check karo agar URL ke andar ||| hai toh unhe alag items bana do
+          url_val = parsed_json.get("url", "")
+          if "|||" in url_val:
+            sub_urls = url_val.split("|||")
+            results = []
+            for sub_u in sub_urls:
+              if sub_u.strip():
+                item_copy = parsed_json.copy()
+                item_copy["url"] = sub_u.strip()
+                results.append(item_copy)
+            return results
+          return [parsed_json]
+        return parsed_json
+      except:
+        if "|||" in decoded_str:
+          split_urls = decoded_str.split("|||")
+          return [{"url": u.strip(), "key": "N/A"} for u in split_urls if u.strip()]
+        return [{"url": decoded_str, "key": "N/A"}]
 
-    if not unique_links:
-        await update.message.reply_text("❌ No links found.")
-        return
+  except Exception as e:
+    print(f"Error decoding: {e}")
+    return None
+  return None
 
-    final_report = "\n".join(unique_links)
 
-    if len(final_report) > 4000:
-        chunks = [final_report[i:i+3900] for i in range(0, len(final_report), 3900)]
-        for chunk in chunks:
-            await update.message.reply_text(chunk, disable_web_page_preview=True)
-    else:
-        await update.message.reply_text(final_report, disable_web_page_preview=True)
+@bot.message_handler(commands=["start", "help"])
+def send_welcome(message):
+  bot.reply_to(
+      message,
+      "⚡ **Fast Decoder Bot Active!**\n\nLinks bhejo, bina kisi `|||` ke"
+      " alag-alag karke mil jayengi.",
+  )
 
-def main():
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        print("Error: BOT_TOKEN Environment Variable missing!")
-        return
 
-    Thread(target=run_flask, daemon=True).start()
+@bot.message_handler(func=lambda message: True)
+def bulk_decode_handler(message):
+  text = message.text.strip()
+  lines = text.splitlines()
 
-    application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("Bot running...")
-    application.run_polling()
+  total_results = []
+  for line in lines:
+    if "http" in line:
+      decoded_data = decode_single_url(line)
+      if decoded_data and isinstance(decoded_data, list):
+        total_results.extend(decoded_data)
 
-if __name__ == '__main__':
-    main()
+  if not total_results:
+    decoded_data = decode_single_url(text)
+    if decoded_data and isinstance(decoded_data, list):
+      total_results = decoded_data
+
+  if total_results:
+    bot.send_message(
+        message.chat.id,
+        f"🔥 **Successfully Decoded ({len(total_results)} items found):**",
+        parse_mode="Markdown",
+    )
+
+    for idx, item in enumerate(total_results, start=1):
+      url = item.get("url", "N/A")
+      key = item.get("key", "N/A")
+      name = item.get("name", "N/A")
+
+      item_text = (
+          f"🔹 **Item #{idx}**\n"
+          f"🏷 **Name:** `{name}`\n"
+          f"🔑 **Key:** `{key}`\n\n"
+          f"🔗 **URL:** {url}"
+      )
+      bot.send_message(message.chat.id, item_text, parse_mode="Markdown")
+  else:
+    bot.reply_to(
+        message,
+        "❌ Koi valid encoded link nahi mila. Dobara check karo bhai!",
+    )
+
+
+if __name__ == "__main__":
+  print("🚀 Fast Decoder Bot is running...")
+  bot.infinity_polling()
